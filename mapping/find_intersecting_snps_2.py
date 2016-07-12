@@ -307,7 +307,7 @@ def write_read_seqs(both_read_seqs, keep, remap_bam, fastqs, dropped=None, remap
         first = True
         # Some python fanciness to deal with single or paired end reads (or
         # n-ended reads, if such technology ever happens.
-        for read_seqs in it.product(*seqs):
+        for read_seqs in zip(*seqs):
             if first:
                 first = False
                 continue
