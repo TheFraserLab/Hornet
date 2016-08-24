@@ -88,7 +88,8 @@ def reverse_complement(seq):
     return seq.translate(RC_TABLE)[::-1]
 
 
-def get_dual_read_seqs(read1, read2, snp_dict, indel_dict, dispositions):
+def get_dual_read_seqs(read1, read2, snp_dict, indel_dict, dispositions,
+                       phased=False):
     """ For each pair of reads, get all concordant SNP substitutions
 
     Note that if the reads overlap, the matching positions in read1 and read2
@@ -97,13 +98,11 @@ def get_dual_read_seqs(read1, read2, snp_dict, indel_dict, dispositions):
     if read1.is_unmapped or read2.is_unmapped:
         dispositions['unmapped read'] += 1
         return [[], []]
-    seq1 = read1.seq
-    seq2 = read2.seq
-    seqs1, seqs2 = [read1.seq], [read2.seq]
 
     chrom = read1.reference_name
     snps = {}
     read_posns = defaultdict(lambda: [None, None])
+
 
     for (read_pos1, ref_pos) in read1.get_aligned_pairs(matches_only=True):
         if indel_dict[chrom].get(ref_pos, False):
@@ -124,6 +123,59 @@ def get_dual_read_seqs(read1, read2, snp_dict, indel_dict, dispositions):
     if product(len(i) for i in snps.values()) > MAX_SEQS_PER_READ:
         dispositions['toss_manysnps'] += 1
         return [[], []]
+
+    seq1 = read1.seq
+    seq2 = read2.seq
+
+    if len(snps) == 0:
+        dispositions['no_snps'] += 1
+        return [[seq1], [seq2]]
+    num_alleles = len(next(iter(snps.values())))
+    if num_alleles > 2:
+        raise NotImplementedError("We can't yet do multiple phased genomes")
+
+    if phased:
+        reads1 = [[seq1], []]
+        reads2 = [[seq2], []]
+        last_pos1 = 0
+        last_pos2 = 0
+        for ref_pos in sorted(snps):
+            pos1, pos2 = read_posns[ref_pos]
+            alleles = snps[ref_pos]
+            if pos1 is not None:
+                is_alt = alleles.find(seq1[pos1])
+                if is_alt == -1:
+                    dispositions['non_refalt_base']
+                    return [[], []]
+                allele = alleles[1-is_alt]
+                reads1[1].append(seq1[last_pos1:pos1])
+                reads1[1].append(allele)
+                last_pos1 = pos1 + 1
+
+            if pos2 is not None:
+                is_alt = alleles.find(seq2[pos2])
+                if is_alt == -1:
+                    dispositions['non_refalt_base']
+                    return [[], []]
+                allele = alleles[1-is_alt]
+                reads2[1].append(seq2[last_pos2:pos2])
+                reads2[1].append(allele)
+                last_pos2 = pos2 + 1
+            if pos1 is not None and pos2 is not None and seq1[pos1] != seq2[pos2]:
+                dispositions['toss_anomalous_phase'] += 1
+                return [[], []]
+
+        reads1[1].append(seq1[last_pos1:])
+        reads2[1].append(seq2[last_pos2:])
+        if len(snps) == 0:
+            dispositions['no_snps'] += 1
+        else:
+            dispositions['has_snps'] += 1
+        return [[''.join(r) for r in reads1], [''.join(r) for r in reads2]]
+
+
+    seqs1, seqs2 = [read1.seq], [read2.seq]
+
 
     for ref_pos in snps:
         alleles = snps[ref_pos]
@@ -164,13 +216,15 @@ def get_dual_read_seqs(read1, read2, snp_dict, indel_dict, dispositions):
         dispositions['has_snps'] += 1
     return seqs1, seqs2
 
-def get_read_seqs(read, snp_dict, indel_dict, dispositions):
+def get_read_seqs(read, snp_dict, indel_dict, dispositions, phased=False):
     """ For each read, get all possible SNP substitutions
 
     for N biallelic snps in the read, will return 2^N reads
     """
     num_snps = 0
     seqs = [read.seq]
+    if phased:
+        raise NotImplementedError("Not yet implemented. It should work with paired end reads, though")
 
     chrom = read.reference_name
     for (read_pos, ref_pos) in read.get_aligned_pairs(matches_only=True):
@@ -207,7 +261,7 @@ def get_read_seqs(read, snp_dict, indel_dict, dispositions):
         dispositions['has_snps'] += 1
     return seqs
 
-def assign_reads(insam, snp_dict, indel_dict, is_paired=True):
+def assign_reads(insam, snp_dict, indel_dict, is_paired=True, phased=False):
     """ Loop through all the reads in insam and output them to the appropriate file
 
 
@@ -239,7 +293,8 @@ def assign_reads(insam, snp_dict, indel_dict, is_paired=True):
         if i % 10000 == 0:
             pass
         if not is_paired:
-            read_seqs = get_read_seqs(read, snp_dict, indel_dict, read_results)
+            read_seqs = get_read_seqs(read, snp_dict, indel_dict, read_results,
+                                     phased)
             write_read_seqs([(read, read_seqs)], keep, remap_bam, fastqs)
         elif read.is_proper_pair:
             slot_self = read.is_read2 # 0 if is_read1, 1 if read2
@@ -249,7 +304,8 @@ def assign_reads(insam, snp_dict, indel_dict, is_paired=True):
                 both_reads[slot_self] = read
                 both_reads[slot_other] = unpaired_reads[slot_other].pop(read.qname)
                 both_seqs = get_dual_read_seqs(both_reads[0], both_reads[1],
-                                               snp_dict, indel_dict, read_results)
+                                               snp_dict, indel_dict,
+                                               read_results, phased)
                 both_read_seqs = list(zip(both_reads, both_seqs))
                 remap_num += write_read_seqs(both_read_seqs, keep, remap_bam,
                                              fastqs, dropped_bam, remap_num)
@@ -301,7 +357,7 @@ def write_read_seqs(both_read_seqs, keep, remap_bam, fastqs, dropped=None, remap
             read.reference_name,
             left_pos,
             right_pos,
-            num_seqs-1,
+            len(seqs[0])-1,
         )
 
         first = True
@@ -339,6 +395,13 @@ if __name__ == "__main__":
                         action='store_true', dest='is_sorted', default=False,
                         help=('Indicates that the input bam file'
                               ' is coordinate sorted (default is False)'))
+    parser.add_argument('-P', "--phased-snp-data",
+                       dest='is_phased', action='store_true', default=False,
+                       help=('SNP data is phased---useful if there is a '
+                             + 'defined "reference" and "alternate", such as '
+                             + 'in  a hybrid. If enabled, will only generate '
+                             + '2 reads per input read, rather than 2^N_snps.')
+                      )
 
 
     parser.add_argument("infile", type=Samfile, help=("Coordinate sorted bam "
@@ -359,4 +422,5 @@ if __name__ == "__main__":
 
     print("Done with SNPs")
 
-    assign_reads(options.infile, SNP_DICT, INDEL_DICT, options.is_paired_end)
+    assign_reads(options.infile, SNP_DICT, INDEL_DICT, options.is_paired_end,
+                 options.is_phased)
