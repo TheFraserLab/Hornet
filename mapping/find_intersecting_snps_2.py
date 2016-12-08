@@ -9,6 +9,7 @@ RAM.
 from __future__ import print_function
 import argparse
 import gzip
+import time
 import itertools as it
 from collections import defaultdict, Counter
 from glob import glob
@@ -22,7 +23,7 @@ except ImportError as exc:
     # We better hope we're in Python 2.
     print(exc)
 
-MAX_SEQS_PER_READ = 1024
+MAX_SEQS_PER_READ = 32
 
 def product(iterable):
     "Returns the product of all items in the iterable"
@@ -44,7 +45,8 @@ def get_snps(snpdir, chrom_only = None):
     """
     snp_dict = defaultdict(dict)
     if path.exists(path.join(snpdir, 'all.txt.gz')):
-        print("Loading snps from consolidated file")
+        print(time.strftime(("%b %d ") + time.strftime("%I:%M:%S")),\
+         ".... Loading snps from consolidated file.")
         for line in gzip.open(path.join(snpdir, 'all.txt.gz'), 'rt', encoding='ascii'):
             chrom, pos, ref, alt = line.split()
             if chrom_only is not None and chrom != chrom_only:
@@ -53,10 +55,11 @@ def get_snps(snpdir, chrom_only = None):
             snp_dict[chrom][pos] = "".join([ref, alt])
         return snp_dict
     for fname in glob(path.join(snpdir, '*.txt.gz')):
-        chrom = path.basename(fname).split('.')[0]
+        chrom = path.basename(fname).split('.snps.txt.gz')[0]
         if chrom_only is not None and chrom != chrom_only:
             continue
-        print("Loading snps from ", fname)
+        print(time.strftime(("%b %d ") + time.strftime("%I:%M:%S")), \
+            ".... Loading snps from", fname)
         i = -1
         for i, line in enumerate(gzip.open(fname, 'rt', encoding='ascii')):
             pos, ref, alt = line.split()
@@ -178,11 +181,18 @@ def get_dual_read_seqs(read1, read2, snp_dict, indel_dict, dispositions,
 
 
     for ref_pos in snps:
+        match = False
+        dispositions['total_snps'] += 1
         alleles = snps[ref_pos]
         pos1, pos2 = read_posns[ref_pos]
         new_seqs1 = []
         new_seqs2 = []
         if pos1 is None:
+            if seq2[pos2] in alleles:
+                dispositions['ref_match'] += 1
+            else:
+                dispositions['no_match'] += 1
+
             for allele in alleles:
                 if allele == seq2[pos2]:
                     continue
@@ -191,6 +201,11 @@ def get_dual_read_seqs(read1, read2, snp_dict, indel_dict, dispositions,
                     new_seqs2.append(''.join([seq2[:pos2], allele, seq2[pos2+1:]]))
 
         elif pos2 is None:
+            if seq1[pos1] in alleles:
+                dispositions['ref_match'] += 1
+            else:
+                dispositions['no_match'] += 1
+
             for allele in alleles:
                 if allele == seq1[pos1]:
                     continue
@@ -201,6 +216,10 @@ def get_dual_read_seqs(read1, read2, snp_dict, indel_dict, dispositions,
             if seq1[pos1] != seq2[pos2]:
                 dispositions['toss_anomalous_phase'] += 1
                 return [[], []]
+            if seq2[pos2] in alleles:
+                dispositions['ref_match'] += 1
+            else:
+                dispositions['no_match'] += 1
             for allele in alleles:
                 if allele == seq2[pos2]:
                     continue
@@ -238,6 +257,8 @@ def get_read_seqs(read, snp_dict, indel_dict, dispositions, phased=False):
             return []
 
         if ref_pos in snp_dict[chrom]:
+            dispositions['total_snps'] += 1
+
             read_base = read.seq[read_pos]
             if read_base in snp_dict[chrom][ref_pos]:
                 dispositions['ref_match'] += 1
@@ -290,6 +311,7 @@ def assign_reads(insam, snp_dict, indel_dict, is_paired=True, phased=False):
     read_results = Counter()
     remap_num = 1
     for i, read in enumerate(insam):
+        read_results['total'] += 1
         if i % 10000 == 0:
             pass
         if not is_paired:
@@ -297,7 +319,7 @@ def assign_reads(insam, snp_dict, indel_dict, is_paired=True, phased=False):
                                      phased)
             write_read_seqs([(read, read_seqs)], keep, remap_bam, fastqs)
         elif read.is_proper_pair:
-            slot_self = read.is_read2 # 0 if is_read1, 1 if read2
+            slot_self = read.is_read2 # 0 if is_read1, 1 if is_read2
             slot_other = read.is_read1
             if read.qname in unpaired_reads[slot_other]:
                 both_reads = [None, None]
@@ -316,9 +338,43 @@ def assign_reads(insam, snp_dict, indel_dict, is_paired=True, phased=False):
             # Most tools assume reads are paired and do not check IDs. Drop it out.
             continue
     print()
-    print(len(unpaired_reads[0]), len(unpaired_reads[1]))
-    print(read_results)
+    print(time.strftime(("%b %d ") + time.strftime("%I:%M:%S")), ".... Finished!")
+    print()
+    print("RUN STATISTICS:")
 
+    if is_paired:
+        total_pairs = read_results['total']//2
+        print("  Total input reads:", total_pairs, "pairs.")
+        print("  Unpaired reads:", len(unpaired_reads[0]) + len(unpaired_reads[1]), "(" + \
+            "%.2f" % ((len(unpaired_reads[0]) + len(unpaired_reads[1]) / total_pairs)*100) + "%)")
+    else:
+        total_pairs = read_results['total']
+        print("  Total input reads:", total_pairs)
+
+    print("  Reads with no SNPs:", read_results['no_snps'], "(" + "%.2f" % ((read_results\
+        ['no_snps'] / total_pairs)*100) + "%)")
+    print("  Reads overlapping SNPs:", read_results['has_snps'], "(" + "%.2f" % ((read_results\
+        ['has_snps'] / total_pairs)*100) + "%)")
+
+    total_snps = read_results['total_snps']
+    print("  Total SNPs covered:", total_snps)
+    print("\tReference SNP matches:", read_results['ref_match'], "(" + "%.2f" % ((read_results\
+            ['ref_match'] / total_snps)*100) + "%)")
+    print("\tNon-reference SNP matches:", read_results['no_match'], "(" + "%.2f" % ((read_results\
+            ['no_match'] / total_snps)*100) + "%)")
+
+    print("  Reads dropped [INDEL]:", read_results['toss_indel'], "(" + "%.2f" % ((read_results\
+        ['toss_indel'] / total_pairs)*100) + "%)")
+    print("  Reads dropped [too many SNPs]:", read_results['toss_manysnps'], "(" + "%.2f" % \
+        ((read_results['toss_manysnps'] / total_pairs)*100) + "%)")
+
+    if is_paired:
+        print("  Reads dropped [anomalous pair]:", read_results['toss_anomalous_phase'], "(" + \
+            "%.2f" % ((read_results['toss_anomalous_phase'] / total_pairs)*100) + "%)")
+        print("  Reads dropped [not proper pair]:", read_results['not_proper_pair'], "(" + "%.2f" % \
+            ((read_results['not_proper_pair'] / total_pairs)*100) + "%)")
+
+    print()
 
 def write_read_seqs(both_read_seqs, keep, remap_bam, fastqs, dropped=None, remap_num=0):
     """Write the given reads out to the appropriate file
@@ -334,9 +390,8 @@ def write_read_seqs(both_read_seqs, keep, remap_bam, fastqs, dropped=None, remap
     """
     reads, seqs = zip(*both_read_seqs)
     assert len(reads) == len(fastqs)
-
-    num_seqs = product(len(r[1]) for r in both_read_seqs)
-    if num_seqs == 0 or num_seqs > MAX_SEQS_PER_READ:
+    num_seqs = len(both_read_seqs[0][1])
+    if num_seqs == 0:
         if dropped is not None:
             for read in reads:
                 dropped.write(read)
@@ -420,7 +475,7 @@ if __name__ == "__main__":
     SNP_DICT = get_snps(options.snp_dir, options.limit_to_chrom)
     INDEL_DICT = get_indels(SNP_DICT)
 
-    print("Done with SNPs")
+    print(time.strftime(("%b %d ") + time.strftime("%I:%M:%S")), ".... Done with SNPs.")
 
     assign_reads(options.infile, SNP_DICT, INDEL_DICT, options.is_paired_end,
                  options.is_phased)
