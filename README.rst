@@ -6,13 +6,6 @@ A pipeline for unbiased allele-specific read mapping based on the
 `WASP pipeline <https://github.com/bmvdgeijn/WASP>`_ by the
 `Pritchard lab <http://pritchardlab.stanford.edu/home.html>`_.
 
-.. image:: https://api.codacy.com/project/badge/Grade/d5789e7ecf184f85a9364996aae78753
-   :alt: Codacy Badge
-   :target: https://www.codacy.com/app/mike-dacre/Hornet?utm_source=github.com&amp;utm_medium=referral&amp;utm_content=TheFraserLab/Hornet&amp;utm_campaign=badger
-.. image:: https://travis-ci.org/TheFraserLab/Hornet.svg?branch=master
-   :alt: Travis CI Status 
-   :target: https://travis-ci.org/TheFraserLab/Hornet
-
 Introduction
 ############
 
