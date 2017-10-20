@@ -1,816 +1,481 @@
+""" find_intersecting_snps
+
+This is a rewrite of the official WASP code.  It has a more straightforward
+design, that is faster and has no maximum window size, but requires loading all
+SNPs into memory at once. For reference, 70 million SNPs requires about 10GB of
+RAM.
+
+"""
+from __future__ import print_function
 import argparse
 import gzip
-import sys
+import time
+import itertools as it
+from collections import defaultdict, Counter
+from glob import glob
+from os import path
+from pysam import AlignmentFile as Samfile
 
-import array
-import pysam
+try:
+    from functools import reduce
+    from operator import mul
+except ImportError as exc:
+    # We better hope we're in Python 2.
+    print(exc)
 
+MAX_SEQS_PER_READ = 32
 
-MAX_WINDOW_DEFAULT = 100000
+def product(iterable):
+    "Returns the product of all items in the iterable"
+    return reduce(mul, iterable, 1)
 
-class SNP:
-    """SNP objects hold data for a single SNP"""
+def get_snps(snpdir, chrom_only = None):
+    """Get SNPs from a single file or directory of files
 
-    def __init__(self, snp_line):
-        """
-        Initialize SNP object.
-        
-        Parameters:
-        -----------
-
-        snp_line : str
-            Line from SNP file.
-
-        Attributes:
-        -----------
-
-        pos : int
-            Genomic position of SNP.
-
-        alleles : list
-            List of two alleles.
-
-        ptype : str
-            Type of polymorphism (snp or indel). If there are multiple alleles
-            and one is an indel, ptype will be "indel". If the alleles are all
-            single nucleotide variants, ptype will be "snp".
-
-        max_len : int
-            Maximum allele length. If greater than one, implies an insertion.
-
-        """
-        snp_split = snp_line.strip().split()
-        self.pos = int(snp_split[0]) - 1
-        self.alleles = [snp_split[1], snp_split[2]]
-        self.ptype = "snp"
-        self.max_len = 0
-        
-        for i in range(len(self.alleles)):
-            if self.alleles[i] == "-":
-                self.alleles[i] = ""
-                self.ptype = "indel"
-            elif len(self.alleles[i]) > self.max_len:
-                self.max_len = len(self.alleles[i])
-                
-        if self.max_len > 1:
-            self.ptype = "indel"
-        
-    def add_allele(self, new_alleles):
-        """
-        Add new alleles for a snp or indel.
-        
-        Parameters:
-        -----------
-
-        new_alleles : list
-            List of alleles (each allele is a string like "A").
-
-        """
-        # If a string is passed, each element of the string will be added as an
-        # allele.
-        assert type(new_alleles) is list
-        for new_allele in new_alleles:
-            if new_allele == "-":
-                self.ptype = "indel"
-                new_allele = ""
-            # Only add the new allele if it doesn't already exist.
-            if not (new_allele in self.alleles):
-                self.alleles.append(new_allele)
-                if len(new_allele) > self.max_len:
-                    self.max_len = len(new_allele)
-                    
-        if self.max_len > 1:
-            self.ptype = "indel"
-
-    def shift_indel(self):
-        """
-        Currently not used anywhere.
-        """
-        self.pos += 1
-        self.max_len -= 1
-        i = 0
-        while i < len(self.alleles):
-            if len(self.alleles) <= 1:
-                self.alleles.pop(i)
-            else:
-                self.alleles[i] = self.alleles[i][1:]
-                i += 1
-        self.alleles.append("")
-
-class BamScanner:
+    Returns a dictionary of dictionaries:
+    snp_dict = {
+                'chrom1' : {
+                            pos1 : [ref, alt],
+                            pos2 : [ref, alt],
+                           },
+                'chrom2' : {...},
+                ...
+                }
+    where positions are 0-based
     """
-    Class to keep track of all the information read in from the bamfile/snpfile.
+    snp_dict = defaultdict(dict)
+    if path.exists(path.join(snpdir, 'all.txt.gz')):
+        print(time.strftime(("%b %d ") + time.strftime("%I:%M:%S")),\
+         ".... Loading snps from consolidated file.")
+        for line in gzip.open(path.join(snpdir, 'all.txt.gz'), 'rt', encoding='ascii'):
+            chrom, pos, ref, alt = line.split()
+            if chrom_only is not None and chrom != chrom_only:
+                continue
+            pos = int(pos) - 1
+            snp_dict[chrom][pos] = "".join([ref, alt])
+        return snp_dict
+    for fname in glob(path.join(snpdir, '*.txt.gz')):
+        chrom = path.basename(fname).split('.snps.txt.gz')[0]
+        if chrom_only is not None and chrom != chrom_only:
+            continue
+        print(time.strftime(("%b %d ") + time.strftime("%I:%M:%S")), \
+            ".... Loading snps from", fname)
+        i = -1
+        for i, line in enumerate(gzip.open(fname, 'rt', encoding='ascii')):
+            pos, ref, alt = line.split()
+            pos = int(pos) - 1
+            snp_dict[chrom][pos] = "".join([ref, alt])
+    return snp_dict
+
+def get_indels(snp_dict):
+    """Returns a dict-of-dicts with positions of indels
+
+
     """
+    indel_dict = defaultdict(dict)
+    for chrom in snp_dict:
+        for pos, alleles in snp_dict[chrom].items():
+            if ('-' in alleles) or (max(len(i) for i in alleles) > 1):
+                indel_dict[chrom][pos] = True
+    return indel_dict
 
-    def __init__(self, is_paired_end, max_window, file_name, keep_file_name,
-                 remap_name, remap_num_name, fastq_names, snp_dir):
-        """
-        Constructor: opens files, creates initial table.
-        
-        Attributes:
-        -----------
+RC_TABLE = {
+    ord('A'):ord('T'),
+    ord('T'):ord('A'),
+    ord('C'):ord('G'),
+    ord('G'):ord('C'),
+}
 
-        is_paired_end : boolean
-            Boolean indicating whether input data are paired end.
-
-        snp_dir : str
-            Path to directory that contains gzipped SNP files (one per
-            chromosome).
-
-        bamfile : pysam.Samfile
-            Input bam file that we are reading.
-
-        keep_bam : pysam.Samfile
-            Output bam file of reads that do not overlap SNPs.
-
-        remap_bam : pysam.Samfile
-            Output bam file of reads that do overlap SNPs and need to be
-            remapped.
-
-        remap_num_file : gzip.GzipFile
-            File to write XXX to.
-
-        fastqs : list
-            List of gzip.GzipFile objects for the different fastqs that will
-            contain the reads to remap.
-
-        read_table : list
-            List of lists. Sublist i contains the reads whose positions are
-            [real read position] % max_window.
-
-        cur_read : pysam.XXX
-            Current read from the bam file.
-
-        end_of_file : boolean
-            Boolean indicating whether we've reached the end of the bam file.
-
-        remap_num : int
-            A counter for the number of reads to be remapped. This starts at one
-            and is incremented when a read (pair) is written to the fastq
-            file(s). TODO: Is this supposed to start at one?
-
-        ref_match : int
-            This is incremented everytime a read sequence matches a SNP
-            genotype. Note that a particular read sequence can be looked at
-            multiple times if it has multiple SNPs, so this is somewhat hard to
-            interpret.
-
-        alt_match : int
-            This is initialized but not used anywhere.
-
-        no_match : int
-            This is incremented everytime a read sequence doesn't matche a SNP
-            genotype. Note that a particular read sequence can be looked at
-            multiple times if it has multiple SNPs, so this is somewhat hard to
-            interpret.
-
-        toss : int
-            Number of reads tossed.
-
-        nosnp : int
-            Number of reads with no SNPs. If one read in a read pair has a SNP
-            and the other doesn't, both "nosnp" and "remap" (below) will be
-            incremented by one.
-
-        remap : int
-            Number of reads to remap. If one read in a read pair has a SNP and
-            the other doesn't, both "nosnp" and "remap" (below) will be
-            incremented by one.
-
-        tot : int
-            I think this is total number of reads, although it is only
-            incremented in empty_slot_single(self) so it doesn't seem to be
-            fully implemented right now.
-
-        printstats : boolean
-            Boolean for some print statements, currently not used.
-
-        num_reads : int
-            Number of reads for a given window that we have read but not yet
-            written. This number is incremented when we read in a read and
-            decremented when we pop a read out of the read table.
-
-        window_too_small : int
-            The number of reads thrown out because their CIGAR contained a run
-            of N's longer than max_window.
-
-        cur_snp : SNP
-            The current SNP to be or being parsed. 
-
-        pos : int
-            The current genomic position we are analyzing.
-
-        chr_num : int
-            Bam file ID number of the current chromosome we are analyzing.
-
-        chr_name : str
-            Name of the current chromosome we are analyzing.
-
-        max_window : int
-            Size of the window in base pairs to process reads. All of the reads
-            and SNPs within max_window base pairs are processed at once. Any
-            junction-spanning reads (i.e. with N in the cigar) that extend
-            outside of the window are thrown out.
-
-        """
-        
-        self.is_paired_end = is_paired_end
-        
-        # Read in all input files and create output files
-        self.snp_dir = snp_dir
-        self.bamfile = pysam.Samfile(file_name,"rb")
-        self.keep_bam = pysam.Samfile(keep_file_name, "wb",
-                                      template=self.bamfile)
-        self.remap_bam = pysam.Samfile(remap_name, "wb", template=self.bamfile)
-        self.remap_num_file = gzip.open(remap_num_name, "w")
-        self.fastqs = [gzip.open(fqn,"w") for fqn in fastq_names]
-        try:
-            self.cur_read = self.bamfile.next()
-        except:
-            sys.stderr.write("No lines available for input")
-            return()
-        self.end_of_file = False
-
-        self.remap_num = 1
-        self.ref_match = 0
-        self.alt_match = 0
-        self.no_match = 0
-        self.toss = 0
-        self.nosnp = 0
-        self.remap = 0
-        self.tot = 0
-        self.window_too_small = 0
-
-        self.printstats = True
-        
-        self.num_reads = 0
-
-        self.cur_snp = None
-        
-        self.pos = self.cur_read.pos
-        self.chr_num = self.cur_read.tid
-        self.chr_name = self.bamfile.getrname(self.cur_read.tid)
-        self.max_window = max_window
-                
-        # Initialize the read tracking tables.
-        self.read_table = [[] for x in range(self.max_window)]
-        
-        # Initialize the SNP and indel tracking tables.
-        self.switch_chr()
-        
-        # Fill all tables.
-        self.fill_table()
-     
-    def fill_table(self): 
-        """
-        Fills the table of reads starting from the current position and
-        extending for the next <max_window> base pairs. The read table is a
-        list of lists of length max_window. If the position of the current read
-        is 100, the first sublist contains all of the reads at position 100, the
-        next sublist contains all of the reads at position 101, etc.
-        """
-        if self.end_of_file:
-            return()
-            
-        # For first read we need to set self.pos and initialize the SNP table.
-        if self.num_reads == 0:
-            self.pos = self.cur_read.pos
-            self.init_snp_table()
-            #self.num_reads+=1000
-            
-        while (self.cur_read.tid == self.chr_num) and \
-          (self.cur_read.pos < (self.pos + self.max_window)):
-            self.num_reads += 1
-            self.read_table[self.cur_read.pos % self.max_window].append(self.cur_read)
-           
-            # Get a new read and check for the end of the file. 
-            try:
-                self.cur_read = self.bamfile.next()
-            except:
-                self.empty_table()
-                self.end_of_file = True
-                return()
-        
-        # Check to see if we've come across a new chromosome.
-        if self.cur_read.tid != self.chr_num:
-            self.empty_table()
-            self.chr_num = self.cur_read.tid
-            try:
-                self.chr_name = self.bamfile.getrname(self.chr_num)
-            except:
-                sys.stderr.write("Problem with tid: " + str(self.chr_num) + "\n")
-                self.skip_chr()
-            self.pos = self.cur_read.pos
-            self.switch_chr()
-            self.fill_table()
+def reverse_complement(seq):
+    "Reverse complements the string input"
+    return seq.translate(RC_TABLE)[::-1]
 
 
-    def switch_chr(self):
-        """Switches to looking for SNPs on next chromosome."""
-        chr_match = False
-        while not chr_match and not self.end_of_file:
-            try:
-                self.snpfile = gzip.open("%s/%s.snps.txt.gz" 
-                                         % (self.snp_dir,self.chr_name))
-                sys.stderr.write("Starting on chromosome " + self.chr_name+"\n")
-                chr_match = True
-            except:
-                sys.stderr.write("SNP file for chromosome " + 
-                                 self.chr_name + " is not found. Skipping these reads.\n")
-                self.skip_chr()
-        
-        self.end_of_snp_file = False
-        self.get_next_snp()
+def get_dual_read_seqs(read1, read2, snp_dict, indel_dict, dispositions,
+                       phased=False):
+    """ For each pair of reads, get all concordant SNP substitutions
 
-    def init_snp_table(self):
-        """
-        Creates an empty SNP table starting from the position of the current
-        and extending max_window base pairs. The SNP table is max_window long
-        and has a zero if there are no variants overlapping a position or
-        contains a SNP object if there is variant that overlaps a given
-        position. 
-        
-        Also creates an indel table which is a list of lists of length
-        max_window.
+    Note that if the reads overlap, the matching positions in read1 and read2
+    will get the same subsitution as each other.
+    """
+    if read1.is_unmapped or read2.is_unmapped:
+        dispositions['unmapped read'] += 1
+        return [[], []]
 
-        Also creates an indel dict which is a dict whose keys are genomic
-        positions and whose values are SNP objects whose ptype is indel.
-        """
-        # Number of SNPs in this table. I think this is total number of
-        # different alleles across the whole table. I'm not exactly sure.
-        self.num_snps = 0
-        self.indel_dict = {}
-        self.snp_table = [0 for x in range(self.max_window)]
-        self.indel_table = [[] for x in range(self.max_window)]
-        # Get SNPs in this window but skip SNPs that are upstream of the current
-        # read.
-        while not self.end_of_snp_file and self.cur_snp.pos < self.pos:
-            self.get_next_snp()
+    chrom = read1.reference_name
+    snps = {}
+    read_posns = defaultdict(lambda: [None, None])
 
-        # Add SNPs downstream of the current read and within the current window.
-        while not self.end_of_snp_file and (self.cur_snp.pos < self.pos + self.max_window):
-            if self.cur_snp.ptype == "snp":
-                self.add_snp()
+
+    for (read_pos1, ref_pos) in read1.get_aligned_pairs(matches_only=True):
+        if indel_dict[chrom].get(ref_pos, False):
+            dispositions['toss_indel'] += 1
+            return [[], []]
+        if ref_pos in snp_dict[chrom]:
+            snps[ref_pos] = snp_dict[chrom][ref_pos]
+            read_posns[ref_pos][0] = read_pos1
+
+    for (read_pos2, ref_pos) in read2.get_aligned_pairs(matches_only=True):
+        if indel_dict[chrom].get(ref_pos, False):
+            dispositions['toss_indel'] += 1
+            return [[], []]
+        if ref_pos in snp_dict[chrom]:
+            snps[ref_pos] = snp_dict[chrom][ref_pos]
+            read_posns[ref_pos][1] = read_pos2
+
+    if product(len(i) for i in snps.values()) > MAX_SEQS_PER_READ:
+        dispositions['toss_manysnps'] += 1
+        return [[], []]
+
+    seq1 = read1.seq
+    seq2 = read2.seq
+
+    if len(snps) == 0:
+        dispositions['no_snps'] += 1
+        return [[seq1], [seq2]]
+    num_alleles = len(next(iter(snps.values())))
+    if num_alleles > 2:
+        raise NotImplementedError("We can't yet do multiple phased genomes")
+
+    if phased:
+        reads1 = [[seq1], []]
+        reads2 = [[seq2], []]
+        last_pos1 = 0
+        last_pos2 = 0
+        for ref_pos in sorted(snps):
+            pos1, pos2 = read_posns[ref_pos]
+            alleles = snps[ref_pos]
+            if pos1 is not None:
+                is_alt = alleles.find(seq1[pos1])
+                if is_alt == -1:
+                    dispositions['non_refalt_base']
+                    return [[], []]
+                allele = alleles[1-is_alt]
+                reads1[1].append(seq1[last_pos1:pos1])
+                reads1[1].append(allele)
+                last_pos1 = pos1 + 1
+
+            if pos2 is not None:
+                is_alt = alleles.find(seq2[pos2])
+                if is_alt == -1:
+                    dispositions['non_refalt_base']
+                    return [[], []]
+                allele = alleles[1-is_alt]
+                reads2[1].append(seq2[last_pos2:pos2])
+                reads2[1].append(allele)
+                last_pos2 = pos2 + 1
+            if pos1 is not None and pos2 is not None and seq1[pos1] != seq2[pos2]:
+                dispositions['toss_anomalous_phase'] += 1
+                return [[], []]
+
+        reads1[1].append(seq1[last_pos1:])
+        reads2[1].append(seq2[last_pos2:])
+        if len(snps) == 0:
+            dispositions['no_snps'] += 1
+        else:
+            dispositions['has_snps'] += 1
+        return [[''.join(r) for r in reads1], [''.join(r) for r in reads2]]
+
+
+    seqs1, seqs2 = [read1.seq], [read2.seq]
+
+
+    for ref_pos in snps:
+        match = False
+        dispositions['total_snps'] += 1
+        alleles = snps[ref_pos]
+        pos1, pos2 = read_posns[ref_pos]
+        new_seqs1 = []
+        new_seqs2 = []
+        if pos1 is None:
+            if seq2[pos2] in alleles:
+                dispositions['ref_match'] += 1
             else:
-                self.add_indel()
-            self.get_next_snp()
-        
-    def add_snp(self):
-        """
-        Add a SNP to the SNP table. If the SNP table has a zero at this
-        position, the SNP object will replace the zero. If the SNP table
-        already has a SNP object at this position, the SNP will be added as new
-        alleles. 
-        """
-        cur_pos = self.cur_snp.pos % self.max_window
-        if self.snp_table[cur_pos] == 0:
-            self.num_snps += 1
-            self.snp_table[cur_pos] = self.cur_snp
-        elif isinstance(self.snp_table[cur_pos], SNP):
-            self.snp_table[cur_pos].add_allele(self.cur_snp.alleles)     
-            
-    def add_indel(self):
-        """
-        Add an indel to the indel table and indel dict. If there is already an
-        indel in the indel dict at this position, add the alleles from cur_snp.
-        """
-        position = self.cur_snp.pos
-        if self.indel_dict.has_key(position):
-            start = self.indel_dict[position].max_len
-            self.indel_dict[position].add_allele(self.cur_snp.alleles)
+                dispositions['no_match'] += 1
+
+            for allele in alleles:
+                if allele == seq2[pos2]:
+                    continue
+                for seq1, seq2 in zip(seqs1, seqs2):
+                    new_seqs1.append(seq1)
+                    new_seqs2.append(''.join([seq2[:pos2], allele, seq2[pos2+1:]]))
+
+        elif pos2 is None:
+            if seq1[pos1] in alleles:
+                dispositions['ref_match'] += 1
+            else:
+                dispositions['no_match'] += 1
+
+            for allele in alleles:
+                if allele == seq1[pos1]:
+                    continue
+                for seq1, seq2 in zip(seqs1, seqs2):
+                    new_seqs1.append(''.join([seq1[:pos1], allele, seq1[pos1+1:]]))
+                    new_seqs2.append(seq2)
         else:
-            self.indel_dict[position] = self.cur_snp
-            start = 0
-        end = self.indel_dict[position].max_len
-        # max_len is the length of the longest allele for an indel and
-        # "position" is the genomic position of this indel. If the indel_dict
-        # already has an indel at this genomic position, we will append
-        # "position" to all of the positions/sublists in indel_table beyond the
-        # lenght of the indel that already exists. If there isn't already an
-        # indel in indel_table at this "position", we'll append "position" to
-        # all of the sublists in indel_table that are spanned by the indel.
-        i = start
-        while (i < end) and ((self.cur_snp.pos + i) < (self.pos + self.max_window)):
-            self.indel_table[(self.cur_snp.pos + i) % self.max_window].append(position)
-            i += 1
+            if seq1[pos1] != seq2[pos2]:
+                dispositions['toss_anomalous_phase'] += 1
+                return [[], []]
+            if seq2[pos2] in alleles:
+                dispositions['ref_match'] += 1
+            else:
+                dispositions['no_match'] += 1
+            for allele in alleles:
+                if allele == seq2[pos2]:
+                    continue
+                for seq1, seq2 in zip(seqs1, seqs2):
+                    new_seqs1.append(''.join([seq1[:pos1], allele, seq1[pos1+1:]]))
+                    new_seqs2.append(''.join([seq2[:pos2], allele, seq2[pos2+1:]]))
+        seqs1.extend(new_seqs1)
+        seqs2.extend(new_seqs2)
 
-    def get_next_snp(self):
-        """Read in next SNP (and set self.cur_snp) or signal end of file."""
-        snp_line = self.snpfile.readline()
-        if snp_line:
-            self.cur_snp = SNP(snp_line)
+    if len(seqs1) == 1:
+        dispositions['no_snps'] += 1
+    else:
+        dispositions['has_snps'] += 1
+    return seqs1, seqs2
+
+def get_read_seqs(read, snp_dict, indel_dict, dispositions, phased=False):
+    """ For each read, get all possible SNP substitutions
+
+    for N biallelic snps in the read, will return 2^N reads
+    """
+    num_snps = 0
+    seqs = [read.seq]
+    if phased:
+        raise NotImplementedError("Not yet implemented. It should work with paired end reads, though")
+
+    chrom = read.reference_name
+    for (read_pos, ref_pos) in read.get_aligned_pairs(matches_only=True):
+        if ref_pos is None:
+            continue
+        if indel_dict[chrom].get(ref_pos, False):
+            dispositions['toss_indel'] += 1
+            return []
+        if len(seqs) > MAX_SEQS_PER_READ:
+            dispositions['toss_manysnps'] += 1
+            return []
+
+        if ref_pos in snp_dict[chrom]:
+            dispositions['total_snps'] += 1
+
+            read_base = read.seq[read_pos]
+            if read_base in snp_dict[chrom][ref_pos]:
+                dispositions['ref_match'] += 1
+                num_snps += 1
+                for new_allele in snp_dict[chrom][ref_pos]:
+                    if new_allele == read_base:
+                        continue
+                    for seq in list(seqs):
+                        # Note that we make a copy up-front to avoid modifying
+                        # the list we're iterating over
+                        new_seq = seq[:read_pos] + new_allele + seq[read_pos+1:]
+                        seqs.append(new_seq)
+            else:
+                dispositions['no_match'] += 1
         else:
-            self.end_of_snp_file = True
+            # No SNP
+            pass
+    if len(seqs) == 1:
+        dispositions['no_snps'] += 1
+    else:
+        dispositions['has_snps'] += 1
+    return seqs
 
-    def skip_chr(self):
-        """Skips all of the reads from the chromosome of the current read and
-        moves on to the next chromosome. Used if the SNP file can't be
-        located."""
-        while self.cur_read.tid == self.chr_num:
-            try:
-                self.cur_read = self.bamfile.next()
-            except:
-                self.empty_table()
-                self.end_of_file = True
-                return
+def assign_reads(insam, snp_dict, indel_dict, is_paired=True, phased=False):
+    """ Loop through all the reads in insam and output them to the appropriate file
 
-        self.chr_num = self.cur_read.tid
-        try:
-            self.chr_name = self.bamfile.getrname(self.chr_num)
-        except:
-            sys.stderr.write("Problem with tid: " + str(self.chr_num) + "\n")
-            self.skip_chr()
 
-    def empty_slot_single(self):
-        """Processes all reads that map to the current position and
-        removes them from the read table Treats reads as single-end"""        
-        cur_slot = self.pos % self.max_window
-        while len(self.read_table[cur_slot]) > 0:
-            self.tot += 1
-            read = self.read_table[cur_slot].pop()
-            self.num_reads -= 1
-            seqs = self.check_for_snps(read, 0)
-            # num_seqs it the numbers of different sequences for this read which
-            # includes the original sequence as well as the different sequences
-            # with alternate alleles swapped in.
-            num_seqs = len(seqs)
-            if (num_seqs == 0) or (num_seqs > 10):
+    """
+    fname = insam.filename
+    if isinstance(fname, bytes):
+        fname = fname.decode('ascii')
+    basename = fname.rsplit('.', 1)[0]
+    keep = Samfile('.'.join([basename, 'keep.bam']),
+                   'wb',
+                   template=insam)
+    remap_bam = Samfile('.'.join([basename, 'to.remap.bam']),
+                        'wb',
+                        template=insam)
+    dropped_bam = Samfile('.'.join([basename, 'dropped.bam']),
+                          'wb',
+                          template=insam)
+    if is_paired:
+        fastqs = [
+            gzip.open('.'.join([basename, 'remap.fq1.gz']), 'wt'),
+            gzip.open('.'.join([basename, 'remap.fq2.gz']), 'wt'),
+        ]
+    else:
+        fastqs = [gzip.open('.'.join([basename, 'remap.fq.gz']), 'wt'),]
+    unpaired_reads = [{}, {}]
+    read_results = Counter()
+    remap_num = 1
+    for i, read in enumerate(insam):
+        read_results['total'] += 1
+        if i % 10000 == 0:
+            pass
+        if not is_paired:
+            read_seqs = get_read_seqs(read, snp_dict, indel_dict, read_results,
+                                     phased)
+            write_read_seqs([(read, read_seqs)], keep, remap_bam, fastqs)
+        elif read.is_proper_pair:
+            slot_self = read.is_read2 # 0 if is_read1, 1 if is_read2
+            slot_other = read.is_read1
+            if read.qname in unpaired_reads[slot_other]:
+                both_reads = [None, None]
+                both_reads[slot_self] = read
+                both_reads[slot_other] = unpaired_reads[slot_other].pop(read.qname)
+                both_seqs = get_dual_read_seqs(both_reads[0], both_reads[1],
+                                               snp_dict, indel_dict,
+                                               read_results, phased)
+                both_read_seqs = list(zip(both_reads, both_seqs))
+                remap_num += write_read_seqs(both_read_seqs, keep, remap_bam,
+                                             fastqs, dropped_bam, remap_num)
+            else:
+                unpaired_reads[slot_self][read.qname] = read
+        else:
+            read_results['not_proper_pair'] += 1
+            # Most tools assume reads are paired and do not check IDs. Drop it out.
+            continue
+    print()
+    print(time.strftime(("%b %d ") + time.strftime("%I:%M:%S")), ".... Finished!")
+    print()
+    print("RUN STATISTICS:")
+
+    if is_paired:
+        total_pairs = read_results['total']//2
+        print("  Total input reads:", total_pairs, "pairs.")
+        print("  Unpaired reads:", len(unpaired_reads[0]) + len(unpaired_reads[1]), "(" + \
+            "%.2f" % ((len(unpaired_reads[0]) + len(unpaired_reads[1]) / total_pairs)*100) + "%)")
+    else:
+        total_pairs = read_results['total']
+        print("  Total input reads:", total_pairs)
+
+    print("  Reads with no SNPs:", read_results['no_snps'], "(" + "%.2f" % ((read_results\
+        ['no_snps'] / total_pairs)*100) + "%)")
+    print("  Reads overlapping SNPs:", read_results['has_snps'], "(" + "%.2f" % ((read_results\
+        ['has_snps'] / total_pairs)*100) + "%)")
+
+    total_snps = read_results['total_snps']
+    print("  Total SNPs covered:", total_snps)
+    print("\tReference SNP matches:", read_results['ref_match'], "(" + "%.2f" % ((read_results\
+            ['ref_match'] / total_snps)*100) + "%)")
+    print("\tNon-reference SNP matches:", read_results['no_match'], "(" + "%.2f" % ((read_results\
+            ['no_match'] / total_snps)*100) + "%)")
+
+    print("  Reads dropped [INDEL]:", read_results['toss_indel'], "(" + "%.2f" % ((read_results\
+        ['toss_indel'] / total_pairs)*100) + "%)")
+    print("  Reads dropped [too many SNPs]:", read_results['toss_manysnps'], "(" + "%.2f" % \
+        ((read_results['toss_manysnps'] / total_pairs)*100) + "%)")
+
+    if is_paired:
+        print("  Reads dropped [anomalous pair]:", read_results['toss_anomalous_phase'], "(" + \
+            "%.2f" % ((read_results['toss_anomalous_phase'] / total_pairs)*100) + "%)")
+        print("  Reads dropped [not proper pair]:", read_results['not_proper_pair'], "(" + "%.2f" % \
+            ((read_results['not_proper_pair'] / total_pairs)*100) + "%)")
+
+    print()
+
+def write_read_seqs(both_read_seqs, keep, remap_bam, fastqs, dropped=None, remap_num=0):
+    """Write the given reads out to the appropriate file
+
+
+    If there are no SNPs in the read, write it to the BAM file `keep`
+
+    If there are too many SNPs, and `dropped` is provided, write the original
+    read out to `dropped`
+
+    Otherwise, output all possible substitutions to the fastqs for remapping,
+    as well as a bam file containing the original read.
+    """
+    reads, seqs = zip(*both_read_seqs)
+    assert len(reads) == len(fastqs)
+    num_seqs = len(both_read_seqs[0][1])
+    if num_seqs == 0:
+        if dropped is not None:
+            for read in reads:
+                dropped.write(read)
+            return 0
+        else:
+            return 0
+    elif num_seqs == 1:
+        for read, seqs in both_read_seqs:
+            keep.write(read)
+    else:
+        assert len(reads) > 0
+        for read in reads:
+            remap_bam.write(read)
+        left_pos = min(r.pos for r in reads)
+        right_pos = max(r.pos for r in reads)
+        loc_line = '{}:{}:{}:{}:{}'.format(
+            remap_num,
+            read.reference_name,
+            left_pos,
+            right_pos,
+            len(seqs[0])-1,
+        )
+
+        first = True
+        # Some python fanciness to deal with single or paired end reads (or
+        # n-ended reads, if such technology ever happens.
+        for read_seqs in zip(*seqs):
+            if first:
+                first = False
                 continue
-            if (num_seqs == 1):
-                self.keep_bam.write(read)
-            else:
-                self.remap_num_file.write("%i\n" % (num_seqs - 1))
-                self.remap_num_file.flush()
-                self.remap_bam.write(read)
-                for seq in seqs[1:]:
-                    loc_line = "%i:%s:%i:%i" % (
-                        self.remap_num, 
-                        self.chr_name, 
-                        read.pos,
-                        num_seqs - 1)
-                    self.fastqs[0].write("@%s\n%s\n+%s\n%s\n" % (
-                        loc_line, 
-                        seq, 
-                        loc_line,
-                        read.qual))
-                self.remap_num += 1
-        self.shift_SNP_table()
-
-    def empty_slot_paired(self):
-        """Processes all reads that map to the current position and
-        removes them from the read table. Treats reads as paired-end."""
-        
-        cur_slot = self.pos % self.max_window
-
-        # While there are reads in this slot...
-        while len(self.read_table[cur_slot]) > 0:
-            # Pop the first read in the slot
-            read = self.read_table[self.pos % self.max_window].pop()
-            self.num_reads -= 1
-
-            # Figure out the matching read position
-            pair_chr_num = read.rnext 
-            pair_pos = read.mpos 
-            if (pair_chr_num != self.chr_num) or \
-              ((pair_pos - self.pos) > self.max_window):
-                continue
-
-            # Find the slot the matching read is in
-            pair_slot = pair_pos % self.max_window
-            for indx in range(len(self.read_table[pair_slot])):
-                if self.read_table[pair_slot][indx].qname.split(":")[-1] == read.qname.split(":")[-1]:
-                    pair_read = self.read_table[pair_slot].pop(indx)
-                    self.num_reads -= 1
-                    seq1s = self.check_for_snps(read, 0)
-                    seq2s = self.check_for_snps(pair_read, read.mpos - read.pos)
-                    num_seqs = len(seq1s)*len(seq2s)
-                    if (num_seqs == 0) or (num_seqs > 1024):
-                        break
-                    if (num_seqs == 1):
-                        self.keep_bam.write(read)
-                        self.keep_bam.write(pair_read)
-                    else:
-                        self.remap_bam.write(read)
-                        self.remap_bam.write(pair_read)
-                        self.remap_num_file.write("%i\n" % (2*(num_seqs-1)))
-                        first = True
-                        for seq1 in seq1s:
-                            for seq2 in seq2s:
-                                if not first:
-                                    left_pos = min(read.pos, pair_read.pos)
-                                    right_pos = max(read.pos, pair_read.pos)
-                                    loc_line="%i:%s:%i:%i:%i" % (
-                                        self.remap_num,
-                                        self.chr_name,
-                                        left_pos,
-                                        right_pos,
-                                        num_seqs - 1)
-                                    self.fastqs[0].write("@%s\n%s\n+%s\n%s\n" % (
-                                        loc_line,
-                                        seq1,
-                                        loc_line,
-                                        read.qual))
-                                    self.fastqs[1].write("@%s\n%s\n+%s\n%s\n" % (
-                                        loc_line,
-                                        self.reverse_complement(seq2),
-                                        loc_line,
-                                        pair_read.qual))
-                                first=False
-                        self.remap_num+=1
-                    # Stop searching for the pair since it was found.
-                    break 
-        self.shift_SNP_table()
-
-    def check_for_snps(self, read, start_dist):
-        """
-        Checks a single aligned read for overlapping SNPs and creates
-        alternative sequences for remapping.
-
-        Parameters
-        ----------
-        read : pysam.AlignedRead
-            Read to check for SNPs in.
-
-        start_dist : int
-            I think this is the distance from the current position of the
-            BamScanner to the start of the read.
-
-        Returns
-        -------
-        seqs : list
-            List of read sequences. This first entry is the read sequence from
-            the bam file. Any subsequent sequences are the read sequence from
-            the bam file except one base that overlapped a SNP is switched to
-            the other allele. If the list is empty, the read overlaps an indel
-            or has a CIGAR character besides N or M so we throw it out.
-        """
-        indx = read.pos % self.max_window
-        # p keeps track of the number of read bases we've already analyzed. When
-        # p = length of the read, we are done with this read.
-        p = 0
-        # num_snps is the number of SNPs in this read.
-        num_snps = 0
-        # I think seg_len is the distance from the current position of the
-        # BamScanner to where we are 
-        seg_len = start_dist
-        seqs = [read.seq]
-        if start_dist > 0:
-            # has_junc indicates whether the read has an N in the CIGAR although
-            # this doesn't seem to be used anywhere.
-            has_junc = False
-        # read.cigar is a list of tuples. Each tuple has two entries. The first
-        # entry specifies the character in the cigar and the second entry
-        # specifies the length of that character. The values are
-        # M       BAM_CMATCH      0
-        # I       BAM_CINS        1
-        # D       BAM_CDEL        2
-        # N       BAM_CREF_SKIP   3
-        # S       BAM_CSOFT_CLIP  4
-        # H       BAM_CHARD_CLIP  5
-        # P       BAM_CPAD        6
-        # =       BAM_CEQUAL      7
-        # X       BAM_CDIFF       8
-        # So a tuple (0, 5) means five matches and (4, 2) means a soft clip of
-        # two.
-
-        # We'll go through each cigar tuple one at a time.
-        for cigar in read.cigar:
-            seg_len += cigar[1]
-            # Check whether this cigar segment is longer than the max window.
-            # This generally happens if there is a junction read longer than the
-            # max window.
-            if seg_len > self.max_window:
-                self.window_too_small += 1
-                return([])
-
-            if cigar[0] == 4:
-                # CIGAR indicates a soft-clipping
-                p = p + cigar[1]
-            elif cigar[0] == 0:
-                # CIGAR indicates a match alignment to the reference genome.
-                # Since there is a match, let's go through each matched base and
-                # see whether it contains a SNP.
-                for i in range(cigar[1]):  
-                    if len(self.indel_table[indx]) == 0:
-                        snp = self.snp_table[indx]
-                        if snp != 0:
-                            num_snps += 1
-                            if num_snps > 10:
-                                # If there are more than 10 snps overlapping,
-                                # throw out the read to prevent memory blow-up.
-                                # TODO: should we increment self.toss here?
-                                return([])
-                            for seq in list(seqs):
-                                matches = 0
-
-                                for geno in snp.alleles:
-                                    if seq[p] == geno:
-                                        matches += 1
-                                        for alt_geno in snp.alleles:
-                                            if not alt_geno == geno:
-                                                new_seq = (seq[:p] + alt_geno +
-                                                           seq[p+1:])
-                                                seqs.append(new_seq)
-                                if matches == 0:
-                                    self.no_match += 1
-                                else:
-                                    self.ref_match += 1
-                    else:
-                        # It's an indel, throw it out.
-                        self.toss += 1
-                        return([])
-                    indx = (indx + 1) % self.max_window
-                    p += 1
-            elif cigar[0] == 3:
-                # Skipped in the reference genome (splice junction).
-                indx = (indx + cigar[1]) % self.max_window
-                has_junc = True
-            else:
-                # There is a non-N/M in the read CIGAR--throw out the read.
-                print('Cigar: ', cigar[0])
-                self.toss += 1
-                return([])
-                
-        if len(seqs) == 1:
-            self.nosnp += 1
-        else:
-            self.remap += 1
-        return seqs
-    
-    def shift_SNP_table(self):             
-        """Shifts the SNP table over one position and makes sure that
-        indels are not lost."""
-        
-        self.pos += 1
-
-        # Current slot to fill is the position + max_window - 1
-        cur_slot=(self.pos-1) % self.max_window
-
-        # Delete indels that are no longer used (if they ended at the previous position)
-        for indel_pos in self.indel_table[cur_slot]:
-            if (indel_pos + self.indel_dict[indel_pos].max_len-1) == (self.pos-1):
-                del self.indel_dict[indel_pos]
-        
-        self.indel_table[cur_slot]=[]
-        
-        # Carry over indels from the previous slot
-        for indel_pos in self.indel_table[cur_slot-1]:
-            if (indel_pos + self.indel_dict[indel_pos].max_len-1) >= (self.pos+self.max_window-1):
-                self.indel_table[cur_slot].append(indel_pos)
-
-        if self.snp_table[cur_slot] != 0:
-            self.num_snps -= 1
-        self.snp_table[cur_slot] = 0
-
-        # See if there is a SNP overlapping the current spot.
-        while not self.end_of_snp_file and self.pos + self.max_window-1 > self.cur_snp.pos:
-            sys.stderr.write(str(self.num_snps) + " " + str(self.pos) + " " + 
-                             str(self.cur_snp.pos)+" !!!\n")
-            sys.stderr.write("SNP out of order has been skipped\n")
-            self.get_next_snp()
-
-        while not self.end_of_snp_file and (self.cur_snp.pos == (self.pos + self.max_window - 1)):
-            if self.cur_snp.ptype == "snp":
-                self.add_snp()
-            else:
-                self.add_indel()
-                if not self.cur_snp.pos in self.indel_table[cur_slot]:
-                    self.indel_table[cur_slot].append(cur_snp.pos)
-            self.get_next_snp()
-
-    def empty_table(self):
-        """Completely empties the read_table by repeatedly calling
-        empty_slot function"""
-        end_pos = self.pos + self.max_window
-        while self.pos < end_pos:
-            if self.is_paired_end:
-                self.empty_slot_paired()
-            else:
-                self.empty_slot_single()
-
-    def complement(self, letter):
-        if letter == 'A':
-            return('T')
-        elif letter == 'T':
-            return('A')
-        elif letter == 'C':
-            return('G')
-        elif letter == 'G':
-            return('C')
-        else:
-            return(letter)
-
-    def reverse_complement(self, read):
-        # reverse = ""
-        # for letter in read:
-        #     reverse = self.complement(letter) + reverse
-        # return reverse
-        reverse = [self.complement(letter) for letter in list(read)]
-        reverse.reverse()
-        return ''.join(reverse)
-    
-    def run(self):
-        """Iterate through bam and SNP files and write output files."""
-        self.fill_table()
-        while not self.end_of_file:
-            if self.is_paired_end:
-                self.empty_slot_paired()
-            else:
-                self.empty_slot_single()
-            self.fill_table()
-     
-        if self.window_too_small > 0:
-            sys.stderr.write(
-                'Segment distance (from read pair and junction separation) was '
-                'too large for %d reads so those reads have been thrown out. '
-                'Consider increasing the max window '
-                'size.\n' % self.window_too_small)
-
-        sys.stderr.write("Finished!\n")
-        self.keep_bam.close()
-        self.remap_bam.close()
-        self.remap_num_file.close()
-        [x.close() for x in self.fastqs]
+            for seq, read, fastq in zip(read_seqs, reads, fastqs):
+                fastq.write(
+                    "@{loc_line}\n{seq}\n+{loc_line}\n{qual}\n"
+                    .format(
+                        loc_line=loc_line,
+                        seq=reverse_complement(seq) if read.is_reverse else seq,
+                        qual=read.qual)
+                    )
+        return 1
+    return 0
 
 
 
-def main(infile, snp_dir, max_window=MAX_WINDOW_DEFAULT,
-         is_paired_end=False, is_sorted=False):
-    name_split = infile.split(".")
-    
-    if len(name_split) > 1:
-        pref = ".".join(name_split[:-1])
-    else:
-        pref = name_split[0]
-    
-    if not is_sorted:
-        pysam.sort(infile, pref + ".sort")
-        infile = pref + ".sort"
-        sort_file_name = pref + ".sort.bam"
-    else:
-        sort_file_name = infile
-
-    keep_file_name = pref + ".keep.bam"
-    remap_name = pref + ".to.remap.bam"
-    remap_num_name = pref + ".to.remap.num.gz"
-
-    if is_paired_end:
-        fastq_names = [pref + ".remap.fq1.gz",
-                       pref + ".remap.fq2.gz"]
-    else:
-        fastq_names = [pref + ".remap.fq.gz"]
-
-    bam_data = BamScanner(is_paired_end, max_window, 
-                          sort_file_name, keep_file_name, remap_name, 
-                          remap_num_name, fastq_names, snp_dir)
-    bam_data.run()
-    print("Tossed:", bam_data.toss)
-    print("Window too small:", bam.window_too_small)
-    print("No Snps:", bam_data.nosnp)
-    print("Reads to remap:", bam_data.remap)
-
-
-
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    
     parser.add_argument("-p", "--paired_end",
                         action='store_true',
                         dest='is_paired_end', default=False,
                         help=('Indicates that reads are '
                               'paired-end (default is single).'))
-    
+    parser.add_argument('-C', '--limit-to-chrom',
+                        default=None,
+                        help="Limit loading of SNPs to the specified chromosome")
+
     parser.add_argument("-s", "--sorted",
-                        action='store_true', dest='is_sorted',  default=False,
+                        action='store_true', dest='is_sorted', default=False,
                         help=('Indicates that the input bam file'
                               ' is coordinate sorted (default is False)'))
+    parser.add_argument('-P', "--phased-snp-data",
+                       dest='is_phased', action='store_true', default=False,
+                       help=('SNP data is phased---useful if there is a '
+                             + 'defined "reference" and "alternate", such as '
+                             + 'in  a hybrid. If enabled, will only generate '
+                             + '2 reads per input read, rather than 2^N_snps.')
+                      )
 
 
-    mhelp = ('Changes the maximum window to search for SNPs.  The default is '
-             '%d base pairs.  Reads or read pairs that span more than this '
-             'distance (usually due to splice junctions) will be thrown out. '
-             'Increasing this window allows for longer junctions, but may '
-             'increase run time and memory requirements.' % MAX_WINDOW_DEFAULT)
-    parser.add_argument("-m", "--max_window",
-                        action='store', dest='max_window', type=int, 
-                        default=MAX_WINDOW_DEFAULT, help=mhelp)
-    
-    parser.add_argument("infile", action='store', help=("Coordinate sorted bam "
-                        "file."))
+    parser.add_argument("infile", type=Samfile, help=("Coordinate sorted bam "
+                                                      "file."))
     snp_dir_help = ('Directory containing the SNPs segregating within the '
                     'sample in question (which need to be checked for '
                     'mappability issues).  This directory should contain '
                     'sorted files of SNPs separated by chromosome and named: '
                     'chr<#>.snps.txt.gz. These files should contain 3 columns: '
                     'position RefAllele AltAllele')
-    
+
     parser.add_argument("snp_dir", action='store', help=snp_dir_help)
 
     options = parser.parse_args()
-        
-    main(options.infile, options.snp_dir,
-         max_window=options.max_window,
-         is_paired_end=options.is_paired_end,
-         is_sorted=options.is_sorted)
-    
+
+    SNP_DICT = get_snps(options.snp_dir, options.limit_to_chrom)
+    INDEL_DICT = get_indels(SNP_DICT)
+
+    print(time.strftime(("%b %d ") + time.strftime("%I:%M:%S")), ".... Done with SNPs.")
+
+    assign_reads(options.infile, SNP_DICT, INDEL_DICT, options.is_paired_end,
+                 options.is_phased)
