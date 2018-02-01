@@ -135,7 +135,11 @@ def get_dual_read_seqs(read1, read2, snp_dict, indel_dict, dispositions,
         return [[seq1], [seq2]]
     num_alleles = len(next(iter(snps.values())))
     if num_alleles > 2:
-        raise NotImplementedError("We can't yet do multiple phased genomes")
+        # This happens if the SNP dict has multiple rows with the same position
+        # so we just toss the read.
+        dispositions['toss_manysnps'] += 1
+        return [[], []]
+        #  raise NotImplementedError("We can't yet do multiple phased genomes")
 
     if phased:
         reads1 = [[seq1], []]
