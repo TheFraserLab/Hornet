@@ -15,6 +15,7 @@ from collections import defaultdict, Counter
 from glob import glob
 from os import path
 from pysam import AlignmentFile as Samfile
+from warnings import warn, filterwarnings
 
 try:
     from functools import reduce
@@ -137,7 +138,8 @@ def get_dual_read_seqs(read1, read2, snp_dict, indel_dict, dispositions,
     if num_alleles > 2:
         # This happens if the SNP dict has multiple rows with the same position
         # so we just toss the read.
-        dispositions['toss_manysnps'] += 1
+        warn("Multiple SNPs at {}. Position ignored")
+        dispositions['toss_multi_allele_snps'] += 1
         return [[], []]
         #  raise NotImplementedError("We can't yet do multiple phased genomes")
 
@@ -372,6 +374,9 @@ def assign_reads(insam, snp_dict, indel_dict, is_paired=True, phased=False):
     print("  Reads dropped [too many SNPs]:", read_results['toss_manysnps'], "(" + "%.2f" % \
         ((read_results['toss_manysnps'] / total_pairs)*100) + "%)")
 
+    print("  Reads dropped [multivalent SNPs]:", read_results['toss_multi_allele_snps'], "(" + "%.2f" % \
+        ((read_results['toss_manysnps'] / total_pairs)*100) + "%)")
+
     if is_paired:
         print("  Reads dropped [anomalous pair]:", read_results['toss_anomalous_phase'], "(" + \
             "%.2f" % ((read_results['toss_anomalous_phase'] / total_pairs)*100) + "%)")
@@ -462,6 +467,12 @@ if __name__ == "__main__":
                              + '2 reads per input read, rather than 2^N_snps.')
                       )
 
+    parser.add_argument('-Q', '--quiet-multivalent-snps',
+                        action='store_true', default='False',
+                        help=('Silence warnings for SNPs with more than 2 '
+                              'alleles. By default, a warning will be issued')
+                       )
+
 
     parser.add_argument("infile", type=Samfile, help=("Coordinate sorted bam "
                                                       "file."))
@@ -476,6 +487,8 @@ if __name__ == "__main__":
 
     options = parser.parse_args()
 
+    if options.quiet_multivalent_snps:
+        filterwarnings('ignore', "Multiple SNPs .*")
     SNP_DICT = get_snps(options.snp_dir, options.limit_to_chrom)
     INDEL_DICT = get_indels(SNP_DICT)
 
