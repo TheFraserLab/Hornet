@@ -119,7 +119,7 @@ def get_dual_read_seqs(read1, read2, snp_dict, indel_dict, dispositions,
                 if len(snp_dict[chrom][ref_pos]) > 2:
                     # This happens if the SNP dict has multiple rows with the
                     # same position so we just toss the read.
-                    warn("Multiple SNPs at {}:{}. Position ignored".format(chrom, ref_pos))
+                    warn("Multiple alleles at {}:{}. Reads across position ignored".format(chrom, ref_pos))
                     dispositions['toss_multi_allele_snps'] += 1
                     return [[], []]
                     #  raise NotImplementedError("We can't yet do multiple phased genomes")
@@ -480,9 +480,9 @@ if __name__ == "__main__":
 
     options = parser.parse_args()
 
-    filterwarnings('once', "Multiple SNPs .*")
+    filterwarnings('once', "Multiple alleles .*")
     if options.quiet_multivalent_snps:
-        filterwarnings('ignore', "Multiple SNPs .*")
+        filterwarnings('ignore', "Multiple alleles .*")
     SNP_DICT = get_snps(options.snp_dir, options.limit_to_chrom)
     INDEL_DICT = get_indels(SNP_DICT)
 
