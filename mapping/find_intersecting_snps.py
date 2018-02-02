@@ -480,6 +480,7 @@ if __name__ == "__main__":
 
     options = parser.parse_args()
 
+    filterwarnings('once', "Multiple SNPs .*")
     if options.quiet_multivalent_snps:
         filterwarnings('ignore', "Multiple SNPs .*")
     SNP_DICT = get_snps(options.snp_dir, options.limit_to_chrom)
