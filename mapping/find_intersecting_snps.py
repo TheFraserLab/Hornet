@@ -108,21 +108,22 @@ def get_dual_read_seqs(read1, read2, snp_dict, indel_dict, dispositions,
     read_posns = defaultdict(lambda: [None, None])
 
 
-    for (read_pos1, ref_pos) in read1.get_aligned_pairs(matches_only=True):
-        if indel_dict[chrom].get(ref_pos, False):
-            dispositions['toss_indel'] += 1
-            return [[], []]
-        if ref_pos in snp_dict[chrom]:
-            snps[ref_pos] = snp_dict[chrom][ref_pos]
-            read_posns[ref_pos][0] = read_pos1
+    for read in (read1, read2):
+        for (read_pos, ref_pos) in read.get_aligned_pairs(matches_only=True):
+            if indel_dict[chrom].get(ref_pos, False):
+                dispositions['toss_indel'] += 1
+                return [[], []]
+            if ref_pos in snp_dict[chrom]:
+                snps[ref_pos] = snp_dict[chrom][ref_pos]
+                read_posns[ref_pos][0] = read_pos
+                if len(snp_dict[chrom][ref_pos]) > 2:
+                    # This happens if the SNP dict has multiple rows with the
+                    # same position so we just toss the read.
+                    warn("Multiple SNPs at {}:{}. Position ignored".format(chrom, ref_pos))
+                    dispositions['toss_multi_allele_snps'] += 1
+                    return [[], []]
+                    #  raise NotImplementedError("We can't yet do multiple phased genomes")
 
-    for (read_pos2, ref_pos) in read2.get_aligned_pairs(matches_only=True):
-        if indel_dict[chrom].get(ref_pos, False):
-            dispositions['toss_indel'] += 1
-            return [[], []]
-        if ref_pos in snp_dict[chrom]:
-            snps[ref_pos] = snp_dict[chrom][ref_pos]
-            read_posns[ref_pos][1] = read_pos2
 
     if product(len(i) for i in snps.values()) > MAX_SEQS_PER_READ:
         dispositions['toss_manysnps'] += 1
@@ -134,14 +135,6 @@ def get_dual_read_seqs(read1, read2, snp_dict, indel_dict, dispositions,
     if len(snps) == 0:
         dispositions['no_snps'] += 1
         return [[seq1], [seq2]]
-    num_alleles = len(next(iter(snps.values())))
-    if num_alleles > 2:
-        # This happens if the SNP dict has multiple rows with the same position
-        # so we just toss the read.
-        warn("Multiple SNPs at {}. Position ignored")
-        dispositions['toss_multi_allele_snps'] += 1
-        return [[], []]
-        #  raise NotImplementedError("We can't yet do multiple phased genomes")
 
     if phased:
         reads1 = [[seq1], []]
