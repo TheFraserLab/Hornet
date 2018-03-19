@@ -314,7 +314,21 @@ def assign_reads(insam, snp_dict, indel_dict, is_paired=True, phased=False):
     unpaired_reads = [{}, {}]
     read_results = Counter()
     remap_num = 1
-    for i, read in enumerate(insam):
+    global draw_progress
+    if draw_progress:
+        try:
+            from tqdm import tqdm
+            iterator = tqdm(enumerate(insam), total=insam.mapped,
+                            mininterval=5, unit_scale=True, unit='Rd')
+        except:
+            try:
+                from progressbar import ProgressBar
+                iterator = ProgressBar(max_value=insam.mapped)(enumerate(insam))
+            except:
+                iterator = enumerate(insam)
+    else:
+        iterator = enumerate(insam)
+    for i, read in iterator:
         read_results['total'] += 1
         if i % 10000 == 0:
             pass
@@ -461,6 +475,8 @@ if __name__ == "__main__":
                              + 'in  a hybrid. If enabled, will only generate '
                              + '2 reads per input read, rather than 2^N_snps.')
                       )
+    parser.add_argument('--progressbar', action='store_true', default=False,
+                        help='Show a progress bar if possible')
 
 
     parser.add_argument("infile", type=Samfile, help=("Coordinate sorted bam "
@@ -475,6 +491,10 @@ if __name__ == "__main__":
     parser.add_argument("snp_dir", action='store', help=snp_dir_help)
 
     options = parser.parse_args()
+    global draw_progress
+    draw_progress = False
+    if options.progressbar:
+        draw_progress = True
 
     SNP_DICT = get_snps(options.snp_dir, options.limit_to_chrom)
     INDEL_DICT = get_indels(SNP_DICT)
