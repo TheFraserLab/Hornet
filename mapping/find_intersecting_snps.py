@@ -24,6 +24,7 @@ except ImportError as exc:
     print(exc)
 
 MAX_SEQS_PER_READ = 32
+DRAW_PROGRESS = False
 
 def product(iterable):
     "Returns the product of all items in the iterable"
@@ -314,8 +315,8 @@ def assign_reads(insam, snp_dict, indel_dict, is_paired=True, phased=False):
     unpaired_reads = [{}, {}]
     read_results = Counter()
     remap_num = 1
-    global draw_progress
-    if draw_progress:
+    global DRAW_PROGRESS
+    if DRAW_PROGRESS:
         try:
             from tqdm import tqdm
             iterator = tqdm(enumerate(insam), total=insam.mapped,
@@ -491,10 +492,9 @@ if __name__ == "__main__":
     parser.add_argument("snp_dir", action='store', help=snp_dir_help)
 
     options = parser.parse_args()
-    global draw_progress
-    draw_progress = False
+    DRAW_PROGRESS = False
     if options.progressbar:
-        draw_progress = True
+        DRAW_PROGRESS = True
 
     SNP_DICT = get_snps(options.snp_dir, options.limit_to_chrom)
     INDEL_DICT = get_indels(SNP_DICT)
