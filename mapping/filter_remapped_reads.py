@@ -172,7 +172,7 @@ def run(to_remap_bam, remap_bam, keep_bam, is_paired_end):
     )
     sys.stderr.write(
         ("RUN STATISTICS:\n\tTotal remapped read (pair)s: {}\n\t"
-         "Read (pair)s remapped to the correct position: {} {} {:.2%}\n")
+         "Read (pair)s remapped to the correct position: {} {:.2%}\n")
         .format(
             line_num, total_correct, total_correct/float(line_num)
         )
