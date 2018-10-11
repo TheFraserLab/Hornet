@@ -15,6 +15,7 @@ from collections import defaultdict, Counter
 from glob import glob
 from os import path
 from pysam import AlignmentFile as Samfile
+from warnings import warn, filterwarnings
 
 try:
     from functools import reduce
@@ -108,23 +109,24 @@ def get_dual_read_seqs(read1, read2, snp_dict, indel_dict, dispositions,
     read_posns = defaultdict(lambda: [None, None])
 
 
-    for (read_pos1, ref_pos) in read1.get_aligned_pairs(matches_only=True):
-        if indel_dict[chrom].get(ref_pos, False):
-            dispositions['toss_indel'] += 1
-            return [[], []]
-        if ref_pos in snp_dict[chrom]:
-            snps[ref_pos] = snp_dict[chrom][ref_pos]
-            read_posns[ref_pos][0] = read_pos1
+    for i, read in enumerate((read1, read2)):
+        for (read_pos, ref_pos) in read.get_aligned_pairs(matches_only=True):
+            if indel_dict[chrom].get(ref_pos, False):
+                dispositions['toss_indel'] += 1
+                return [[], []]
+            if ref_pos in snp_dict[chrom]:
+                snps[ref_pos] = snp_dict[chrom][ref_pos]
+                read_posns[ref_pos][i] = read_pos
+                if len(snp_dict[chrom][ref_pos]) > 2:
+                    # This happens if the SNP dict has multiple rows with the
+                    # same position so we just toss the read.
+                    warn("Multiple alleles at {}:{}. Reads across position ignored".format(chrom, ref_pos))
+                    dispositions['toss_multi_allele_snps'] += 1
+                    return [[], []]
+                    #  raise NotImplementedError("We can't yet do multiple phased genomes")
 
-    for (read_pos2, ref_pos) in read2.get_aligned_pairs(matches_only=True):
-        if indel_dict[chrom].get(ref_pos, False):
-            dispositions['toss_indel'] += 1
-            return [[], []]
-        if ref_pos in snp_dict[chrom]:
-            snps[ref_pos] = snp_dict[chrom][ref_pos]
-            read_posns[ref_pos][1] = read_pos2
 
-    if product(len(i) for i in snps.values()) > MAX_SEQS_PER_READ:
+    if not phased and product(len(i) for i in snps.values()) > MAX_SEQS_PER_READ:
         dispositions['toss_manysnps'] += 1
         return [[], []]
 
@@ -134,13 +136,6 @@ def get_dual_read_seqs(read1, read2, snp_dict, indel_dict, dispositions,
     if len(snps) == 0:
         dispositions['no_snps'] += 1
         return [[seq1], [seq2]]
-    num_alleles = len(next(iter(snps.values())))
-    if num_alleles > 2:
-        # This happens if the SNP dict has multiple rows with the same position
-        # so we just toss the read.
-        dispositions['toss_manysnps'] += 1
-        return [[], []]
-        #  raise NotImplementedError("We can't yet do multiple phased genomes")
 
     if phased:
         reads1 = [[seq1], []]
@@ -400,7 +395,7 @@ def assign_reads(insam, snp_dict, indel_dict, is_paired=True, phased=False):
     print("  Reads overlapping SNPs:", read_results['has_snps'], "(" + "%.2f" % ((read_results\
         ['has_snps'] / total_pairs)*100) + "%)")
 
-    total_snps = read_results['total_snps']
+    total_snps = read_results['total_snps']+1
     print("  Total SNPs covered:", total_snps)
     print("\tReference SNP matches:", read_results['ref_match'], "(" + "%.2f" % ((read_results\
             ['ref_match'] / total_snps)*100) + "%)")
@@ -410,6 +405,9 @@ def assign_reads(insam, snp_dict, indel_dict, is_paired=True, phased=False):
     print("  Reads dropped [INDEL]:", read_results['toss_indel'], "(" + "%.2f" % ((read_results\
         ['toss_indel'] / total_pairs)*100) + "%)")
     print("  Reads dropped [too many SNPs]:", read_results['toss_manysnps'], "(" + "%.2f" % \
+        ((read_results['toss_manysnps'] / total_pairs)*100) + "%)")
+
+    print("  Reads dropped [multivalent SNPs]:", read_results['toss_multi_allele_snps'], "(" + "%.2f" % \
         ((read_results['toss_manysnps'] / total_pairs)*100) + "%)")
 
     if is_paired:
@@ -467,6 +465,7 @@ def write_read_seqs(both_read_seqs, keep, remap_bam, fastqs, dropped=None, remap
                 first = False
                 continue
             for seq, read, fastq in zip(read_seqs, reads, fastqs):
+                assert len(seq) == len(read.qual)
                 fastq.write(
                     "@{loc_line}\n{seq}\n+{loc_line}\n{qual}\n"
                     .format(
@@ -504,6 +503,12 @@ if __name__ == "__main__":
     parser.add_argument('--progressbar', action='store_true', default=False,
                         help='Show a progress bar if possible')
 
+    parser.add_argument('-Q', '--quiet-multivalent-snps',
+                        action='store_true', default='False',
+                        help=('Silence warnings for SNPs with more than 2 '
+                              'alleles. By default, a warning will be issued')
+                       )
+
 
     parser.add_argument("infile", type=Samfile, help=("Coordinate sorted bam "
                                                       "file."))
@@ -521,6 +526,9 @@ if __name__ == "__main__":
     if options.progressbar:
         DRAW_PROGRESS = True
 
+    filterwarnings('once', "Multiple alleles .*")
+    if options.quiet_multivalent_snps:
+        filterwarnings('ignore', "Multiple alleles .*")
     SNP_DICT = get_snps(options.snp_dir, options.limit_to_chrom)
     INDEL_DICT = get_indels(SNP_DICT)
 
