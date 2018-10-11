@@ -245,42 +245,65 @@ def get_read_seqs(read, snp_dict, indel_dict, dispositions, phased=False):
 
     for N biallelic snps in the read, will return 2^N reads
     """
-    num_snps = 0
-    seqs = [read.seq]
-    if phased:
-        raise NotImplementedError("Not yet implemented. It should work with paired end reads, though")
 
     chrom = read.reference_name
+    snps = {}
+    read_posns = {}
+
     for (read_pos, ref_pos) in read.get_aligned_pairs(matches_only=True):
-        if ref_pos is None:
-            continue
         if indel_dict[chrom].get(ref_pos, False):
             dispositions['toss_indel'] += 1
             return []
-        if len(seqs) > MAX_SEQS_PER_READ:
-            dispositions['toss_manysnps'] += 1
-            return []
-
         if ref_pos in snp_dict[chrom]:
-            dispositions['total_snps'] += 1
+            snps[ref_pos] = snp_dict[chrom][ref_pos]
+            read_posns[ref_pos] = read_pos
 
-            read_base = read.seq[read_pos]
-            if read_base in snp_dict[chrom][ref_pos]:
-                dispositions['ref_match'] += 1
-                num_snps += 1
-                for new_allele in snp_dict[chrom][ref_pos]:
-                    if new_allele == read_base:
-                        continue
-                    for seq in list(seqs):
-                        # Note that we make a copy up-front to avoid modifying
-                        # the list we're iterating over
-                        new_seq = seq[:read_pos] + new_allele + seq[read_pos+1:]
-                        seqs.append(new_seq)
-            else:
-                dispositions['no_match'] += 1
+    if product(len(i) for i in snps.values()) > MAX_SEQS_PER_READ:
+        dispositions['toss_manysnps'] += 1
+        return []
+
+    seq = read.seq
+
+    if len(snps) == 0:
+        dispositions['no_snps'] += 1
+        return [seq]
+
+    num_alleles = len(next(iter(snps.values())))
+    if num_alleles > 2:
+        # This happens if the SNP dict has multiple rows with the same position
+        # so we just toss the read.
+        dispositions['toss_manysnps'] += 1
+        return []
+        #  raise NotImplementedError("We can't yet do multiple phased genomes")
+
+    if phased:
+        raise NotImplementedError("Can't do phases yet")
+
+    seqs = [read.seq]
+
+    for ref_pos in snps:
+        match = False
+        dispositions['total_snps'] += 1
+        alleles = snps[ref_pos]
+        pos = read_posns[ref_pos]
+        new_seqs = []
+        if seq[pos] in alleles:
+            dispositions['ref_match'] += 1
         else:
-            # No SNP
-            pass
+            dispositions['no_match'] += 1
+        for allele in alleles:
+            if allele == seq[pos]:
+                continue
+            new_seqs.append(''.join([seq[:pos], allele, seq[pos+1:]]))
+        seqs.extend(new_seqs)
+    if len(seqs) == 1:
+        dispositions['no_snps'] += 1
+    else:
+        dispositions['has_snps'] += 1
+    return seqs
+
+
+
     if len(seqs) == 1:
         dispositions['no_snps'] += 1
     else:
@@ -330,6 +353,8 @@ def assign_reads(insam, snp_dict, indel_dict, is_paired=True, phased=False):
     else:
         iterator = enumerate(insam)
     for i, read in iterator:
+        if read.is_unmapped:
+            continue
         read_results['total'] += 1
         if i % 10000 == 0:
             pass
