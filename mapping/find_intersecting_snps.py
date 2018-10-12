@@ -271,10 +271,28 @@ def get_read_seqs(read, snp_dict, indel_dict, dispositions, phased=False):
         return []
         #  raise NotImplementedError("We can't yet do multiple phased genomes")
 
-    if phased:
-        raise NotImplementedError("Can't do phases yet")
-
     seqs = [read.seq]
+
+    if phased:
+        reads = [[seq], []]
+        last_pos = 0
+        for ref_pos in sorted(snps):
+            pos = read_posns[ref_pos]
+            alleles = snps[ref_pos]
+            is_alt = alleles.find(seq1[pos])
+            if is_alt == -1:
+                dispositions['non_refalt_base']
+                return []
+            allele = alleles[1-is_alt]
+            reads[1].append(seq[last_pos:pos])
+            reads1[1].append(allele)
+            last_pos = pos + 1
+        reads[1].append(seq1[last_pos:])
+        if len(snps) == 0:
+            dispositions['no_snps'] += 1
+        else:
+            dispositions['has_snps'] += 1
+        return [''.join(r) for r in reads]
 
     for ref_pos in snps:
         match = False
