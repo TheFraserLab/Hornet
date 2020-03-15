@@ -373,7 +373,7 @@ def assign_reads(insam, snp_dict, indel_dict, is_paired=True, phased=False, keep
         total_pairs = read_results['total']//2
         print("  Total input reads:", total_pairs, "pairs.")
         print("  Unpaired reads:", len(unpaired_reads[0]) + len(unpaired_reads[1]), "(" + \
-            "%.2f" % ((len(unpaired_reads[0]) + len(unpaired_reads[1]) / total_pairs)*100) + "%)")
+            "%.2f" % (((len(unpaired_reads[0]) + len(unpaired_reads[1])) / total_pairs)*100) + "%)")
     else:
         total_pairs = read_results['total']
         print("  Total input reads:", total_pairs)
