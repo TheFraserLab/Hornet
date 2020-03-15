@@ -291,12 +291,13 @@ def get_read_seqs(read, snp_dict, indel_dict, dispositions, phased=False):
         dispositions['has_snps'] += 1
     return seqs
 
-def assign_reads(insam, snp_dict, indel_dict, is_paired=True, phased=False):
+def assign_reads(insam, snp_dict, indel_dict, is_paired=True, phased=False, keep_only=None):
     """ Loop through all the reads in insam and output them to the appropriate file
 
 
     """
     fname = insam.filename
+    chroms = insam.references
     if isinstance(fname, bytes):
         fname = fname.decode('ascii')
     basename = fname.rsplit('.', 1)[0]
@@ -334,6 +335,9 @@ def assign_reads(insam, snp_dict, indel_dict, is_paired=True, phased=False):
     else:
         iterator = enumerate(insam)
     for i, read in iterator:
+        if keep_only is not None and chroms[read.reference_id] != keep_only:
+            read_results['skipped'] += 1
+            continue
         read_results['total'] += 1
         if i % 10000 == 0:
             pass
@@ -373,6 +377,8 @@ def assign_reads(insam, snp_dict, indel_dict, is_paired=True, phased=False):
     else:
         total_pairs = read_results['total']
         print("  Total input reads:", total_pairs)
+    if keep_only is not None:
+        print("  Reads on skipped chromosomes", read_results['skipped'])
 
     print("  Reads with no SNPs:", read_results['no_snps'], "(" + "%.2f" % ((read_results\
         ['no_snps'] / total_pairs)*100) + "%)")
@@ -507,4 +513,4 @@ if __name__ == "__main__":
     print(time.strftime(("%b %d ") + time.strftime("%I:%M:%S")), ".... Done with SNPs.")
 
     assign_reads(options.infile, SNP_DICT, INDEL_DICT, options.is_paired_end,
-                 options.is_phased)
+                 options.is_phased, options.limit_to_chrom)
