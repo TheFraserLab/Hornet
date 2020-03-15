@@ -7,6 +7,7 @@ RAM.
 
 """
 from __future__ import print_function
+import sys
 import argparse
 import gzip
 import time
@@ -66,6 +67,9 @@ def get_snps(snpdir, chrom_only = None):
             pos, ref, alt = line.split()
             pos = int(pos) - 1
             snp_dict[chrom][pos] = "".join([ref, alt])
+    if len(snp_dict) == 0:
+        print("ERROR: Could not find appropriate SNP files")
+        sys.exit(1)
     return snp_dict
 
 def get_indels(snp_dict):
@@ -486,8 +490,9 @@ if __name__ == "__main__":
                     'sample in question (which need to be checked for '
                     'mappability issues).  This directory should contain '
                     'sorted files of SNPs separated by chromosome and named: '
-                    'chr<#>.snps.txt.gz. These files should contain 3 columns: '
-                    'position RefAllele AltAllele')
+                    '<chrname>.snps.txt.gz (where chrname is the name of the '
+                    'chromosomes in the bam file). These files should contain '
+                    '3 columns: position RefAllele AltAllele')
 
     parser.add_argument("snp_dir", action='store', help=snp_dir_help)
 
