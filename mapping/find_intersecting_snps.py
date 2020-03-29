@@ -7,6 +7,7 @@ RAM.
 
 """
 from __future__ import print_function
+import sys
 import argparse
 import gzip
 import time
@@ -66,6 +67,9 @@ def get_snps(snpdir, chrom_only = None):
             pos, ref, alt = line.split()
             pos = int(pos) - 1
             snp_dict[chrom][pos] = "".join([ref, alt])
+    if len(snp_dict) == 0:
+        print("ERROR: Could not find appropriate SNP files")
+        sys.exit(1)
     return snp_dict
 
 def get_indels(snp_dict):
@@ -287,12 +291,13 @@ def get_read_seqs(read, snp_dict, indel_dict, dispositions, phased=False):
         dispositions['has_snps'] += 1
     return seqs
 
-def assign_reads(insam, snp_dict, indel_dict, is_paired=True, phased=False):
+def assign_reads(insam, snp_dict, indel_dict, is_paired=True, phased=False, keep_only=None):
     """ Loop through all the reads in insam and output them to the appropriate file
 
 
     """
     fname = insam.filename
+    chroms = insam.references
     if isinstance(fname, bytes):
         fname = fname.decode('ascii')
     basename = fname.rsplit('.', 1)[0]
@@ -330,6 +335,9 @@ def assign_reads(insam, snp_dict, indel_dict, is_paired=True, phased=False):
     else:
         iterator = enumerate(insam)
     for i, read in iterator:
+        if keep_only is not None and chroms[read.reference_id] != keep_only:
+            read_results['skipped'] += 1
+            continue
         read_results['total'] += 1
         if i % 10000 == 0:
             pass
@@ -365,10 +373,12 @@ def assign_reads(insam, snp_dict, indel_dict, is_paired=True, phased=False):
         total_pairs = read_results['total']//2
         print("  Total input reads:", total_pairs, "pairs.")
         print("  Unpaired reads:", len(unpaired_reads[0]) + len(unpaired_reads[1]), "(" + \
-            "%.2f" % ((len(unpaired_reads[0]) + len(unpaired_reads[1]) / total_pairs)*100) + "%)")
+            "%.2f" % (((len(unpaired_reads[0]) + len(unpaired_reads[1])) / total_pairs)*100) + "%)")
     else:
         total_pairs = read_results['total']
         print("  Total input reads:", total_pairs)
+    if keep_only is not None:
+        print("  Reads on skipped chromosomes", read_results['skipped'])
 
     print("  Reads with no SNPs:", read_results['no_snps'], "(" + "%.2f" % ((read_results\
         ['no_snps'] / total_pairs)*100) + "%)")
@@ -486,8 +496,9 @@ if __name__ == "__main__":
                     'sample in question (which need to be checked for '
                     'mappability issues).  This directory should contain '
                     'sorted files of SNPs separated by chromosome and named: '
-                    'chr<#>.snps.txt.gz. These files should contain 3 columns: '
-                    'position RefAllele AltAllele')
+                    '<chrname>.snps.txt.gz (where chrname is the name of the '
+                    'chromosomes in the bam file). These files should contain '
+                    '3 columns: position RefAllele AltAllele')
 
     parser.add_argument("snp_dir", action='store', help=snp_dir_help)
 
@@ -502,4 +513,4 @@ if __name__ == "__main__":
     print(time.strftime(("%b %d ") + time.strftime("%I:%M:%S")), ".... Done with SNPs.")
 
     assign_reads(options.infile, SNP_DICT, INDEL_DICT, options.is_paired_end,
-                 options.is_phased)
+                 options.is_phased, options.limit_to_chrom)
