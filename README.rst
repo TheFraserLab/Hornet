@@ -11,7 +11,7 @@ Introduction
 
 Hornet is a simple set of tools for unbiased allele-specific read mapping
 that is originally described in
-`van de Geijn B, McVicker G, Gilad Y, Pritchard JK. "WASP: allele-specific software for robust discovery of molecular quantitative trait loci" <http://biorxiv.org/content/early/2014/11/07/011221>`_
+`van de Geijn B, McVicker G, Gilad Y, Pritchard JK. "WASP: allele-specific software for robust discovery of molecular quantitative trait loci" <https://www.nature.com/articles/nmeth.3582>
 
 Overview
 ########
@@ -32,124 +32,144 @@ Example:
 ~~~~~~~~
 
 .. code:: shell
-
-  tophat --no-coverage-search -o ${LANE_NAME}_out Sequences/hg18_norand ${LANE_NAME}.fastq.gz
-  samtools view -b -q 10 ${LANE_NAME}_out/accepted_hits.bam > ${LANE_NAME}_out/accepted_hits.quality.bam
+ 
+STAR \
+            --genomeDir genome_dir/STAR \
+            --outFileNamePrefix analysis_dir/STAR1/ \
+            --outSAMattributes MD NH \
+            --outSAMtype BAM Unsorted \
+            --outTmpDir analysis_dir/STAR1/STARtmp \
+            --runThreadN {threads} \
+            --readFilesCommand zcat \
+            --readFilesIn input.R1.fastq.gz input.R2.fastq.gz \
+	    --outFilterMultimapNmax 1
 
 Step 2:
 -------
 
-Use `find_intersecting_snps` to identify reads that may have mapping biases
+Use `find_intersecting_snps` to identify reads that may have mapping biases. 
+It is recommended to remove duplicate reads prior to this step to save time 
+provessing reads that will ultimately be discarded.
 
 Usage::
 
-	find_intersecting_snps.py [-p] <input.bam> <SNP_file_directory>
+	find_intersecting_snps.py [-p][-C][-P][-s] <input.bam> <SNP_directory>
 	   -p indicates that reads are paired-end (default is single)
-	   -m changes the maximum window to search for SNPs.  The default is
-	      100,000 base pairs.  Reads or read pairs that span more than this distance
-	      (usually due to splice junctions) will be thrown out.  Increasing this window
-	      allows for longer junctions, but may increase run time and memory requirements.
+	   -C limits the list of SNPs to those found on a specific chromosome
+	   -P indicates that the list of SNPs are phased; if so, only 2 reads will generated 
+	      per input read that overlaps a SNP (as in a hybrid)
+	   -s indicates that input data are coordinate sorted
 	   <input.bam> is the bamfile from the initial mapping process
-	   <SNP_file_directory> is the directory containing the SNPs segregating within the
+	   <SNP_directory> is the directory containing the SNPs segregating within the
 	      sample in question (which need to be checked for mappability issues).  This directory
-	      should contain sorted files of SNPs separated by chromosome and named:
+	      should contain coordinate sorted files of SNPs separated by chromosome and named:
 	         chr<#>.snps.txt.gz
 	      These files should contain 3 columns: position RefAllele AltAllele
 
 
 Output::
 
-	input.sort.bam - Sorted bamfile of the original input
 	input.keep.bam - bamfile with reads that did not intersect SNPs or indels and therefore can
 	   be kept without remapping
 	input.to.remap.bam - bamfile with original reads that overlapped SNPs that need to be remapped
-	input.to.remap.num.gz - the number of variants of the original read that must be remapped
 	input.remap.fq.gz - fastq file containing the reads with the new variants to remap. If the
 	    paired-end option is used two files ending with .fq1.gz and .fq2.gz will be output.
+	    
+	Run statistics: run statistics will be reported once this step is complete, and include:
+	  - Total input reads
+	  - Reads with no SNPs
+	  - Reads overlapping SNPs
+	  - Total SNPs covered (refers to the number of instances where a read was found to overlap a SNP)
+	  - Reference SNP matches (refers to the % of 'Total SNPs covered' that match EITHER allele in the SNP file; 
+	  	should be as close to 100% as possible if SNPs have been called correctly)
+	  - Non-reference SNP matches (should be a low %, caused by mutations or sequencing errors)
+	  - Reads dropped [INDEL]
+	  - Reads dropped [too many SNPs]
+	  - Reads dropped [multivalent SNPs] (indicates a single read had SNPs matching both the ref and alt alleles)
 	
 	Note: Reads that overlap indels are currently excluded and will not be present in any of the 'remap' files
 	or the input.keep.bam file. For this reason the total number of reads will not add up to the
 	number of reads provided in the input.sort.bam file.
 
-To make the snps.txt.gz files, from vcf files separated by chromosome:
 
-.. code:: bash
-
-    mkdir snps
-    for i in chr*.vcf.gz; do j=$(echo $i | sed 's/\..*//'); pigz -dc $i | grep -v "^#" | awk '{if ((length($4) == 1) && (length($5) == 1)) printf ("%s\t%s\t%s\n", $2, $4, $5)}' | pigz > ${j}.snps.txt.gz; done
-
-
-From a single vcf:
-
-.. code:: bash
-
-    mkdir snps
-    pigz -dc data.vcf.gz | grep -v "^#" | awk '{if ((length($4) == 1) && (length($5) == 1)) printf ("%s\t%s\t%s\n", $2, $4, $5) | "pigz > snps/"$1".snps.txt.gz"}'
-
-pigz just parallelized gzip, if you don't have it, substitute `pigz` with `gzip`.
-
-Example:
-~~~~~~~~
+Example (after removing duplicates):
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 .. code:: shell
 
-   find_intersecting_snps ${LANE_NAME}_out/accepted_hits.quality.bam SNP_files/
+   python find_intersecting_snps.py \
+        -p -P -s\
+        rmdup.bam SNP_directory
 
 Step 3
------
-Map the input.remap.fq.gz using the same mapping arguments used in Step 1. Note that
-the arguments should be exactly the same as those in Step 1 EXCEPT for arguments that
+------
+Map the input.remap.fq.gz file(s) using the same mapping arguments used in Step 1. 
+The arguments should be exactly the same as those in Step 1 EXCEPT for arguments that
 directly modify the reads that are used by the aligner. For example the read trimming
 arguments to bowtie (-3 and -5 arguments) should be used in Step 1 ONLY because
-they modify the reads that are output by bowtie.
+they modify the reads that are output by bowtie. If you used 2-pass mapping in STAR 
+where splice junctions were included, you can use the same SJ.out.tab file for remapping 
+in this step.
 
 Example:
 ~~~~~~~~
 
 .. code:: shell
 
-  tophat --no-coverage-search -o ${LANE_NAME}_out_remap hg18_norand ${LANE_NAME}_out/accepted_hits.quality.remap.fq.gz
-  samtools view -b -q 10 ${LANE_NAME}_out_remap/accepted_hits.bam > ${LANE_NAME}_out_remap/accepted_hits.quality.bam
-
+STAR \
+            --genomeDir genome_dir/STAR \
+            --outFileNamePrefix analysis_dir/remap/ \
+            --outSAMattributes MD NH \
+            --outSAMtype BAM Unsorted \
+            --outTmpDir analysis_dir/remap/STARtmp \
+            --runThreadN {threads} \
+            --readFilesCommand zcat \
+            --readFilesIn rmdup.remap.fq1.gz rmdup.remap.fq2.gz \
+	    --outFilterMultimapNmax 1
+	    
+	    mv analysis_dir/remap/remapAligned.out.bam rmdup.remap.bam
 
 Step 4
 ------
-Use filter_remapped_reads.py to retrieve reads that remapped correctly
+Use filter_remapped_reads.py to retrieve reads that remapped correctly.
+The remapped bam file MUST be sorted by read name for this step. The read names
+contain the original mapping information, which is needed in this step to 
+determine whether the reads mapped to the same location. 
 
 Usage::
 
-	filter_remapped_reads.py [-p] <to.remap.bam> <remapped_reads.bam> <output.bam> <to.remap.num.gz>
+	filter_remapped_reads.py [-p] <to.remap.bam> <remapped_reads.bam> <output.bam>
 	   -p option indicates that the reads are paired-end
 	   <to.remap.bam> output from find_intersecting_snps.py which contains
 	      the original aligned reads that were remapped
 	   <remapped_reads.bam> output from the second mapping step (Step 3)
 	   <output.bam> file where reads that are kept after remapping are stored
-	   <to.remap.num.gz> is the file from find_intersecting_snps.py which contains
-	      the number of remapped sequences
+	   
 
 Example:
 ~~~~~~~~
 
 .. code:: shell
 
-  filter_remapped_reads ${LANE_NAME}_out/accepted_hits.quality.to.remap.bam ${LANE_NAME}_out_remap/accepted_hits.quality.bam ${LANE_NAME}.remap.keep.bam ${LANE_NAME}_out/accepted_hits.quality.to.remap.num.gz
+ samtools sort -n rmdup.remap.bam -o rmdup.remap.sort.bam
 
-At the end of the pipeline, ${LANE_NAME}.keep.bam and ${LANE_NAME}.remap.keep.bam
-can be merged for a complete set of mappability filtered aligned reads. The merged
-file should then be sorted and indexed:
+ python filter_remapped_reads.py \
+        -p \
+        rmdup.to.remap.bam rmdup.remap.sort.bam \
+        rmdup.remap.kept.bam
+
+At the end of the pipeline, rmdup.remap.keep.bam and rmdup.remap.keep.bam
+can be sorted and merged for a complete set of mappability filtered aligned reads. 
+The merged file should then be indexed:
 
 .. code:: shell
 
-  samtools merge ${LANE_NAME}.keep.merged.bam ${LANE_NAME}.keep.bam ${LANE_NAME}.remap.keep.bam
-  samtools sort ${LANE_NAME}.keep.merged.bam ${LANE_NAME}.keep.merged.sorted
-  samtools index ${LANE_NAME}.keep.merged.sorted.bam
+  samtools sort rmdup.remap.kept.bam -o rmdup.remap.kept.sort.bam
+  samtools sort rmdup.keep.bam -o rmdup.keep.sort.bam
+  samtools merge rmdup.remap.kept.merged.bam rmdup.keep.sort.bam rmdup.remap.kept.sort.bam
+  samtools index rmdup.remap.kept.merged.bam
 
-Step 5 (Optional)
------------------
 
-Filter duplicate reads. Programs such as samtools rmdup introduce bias when
-they filter duplicate reads because they retain the read with the highest score
-(which usually matches the reference).
 
 Dependencies
 ############
@@ -168,8 +188,3 @@ Installation
    pip install https://github.com/TheFraserLab/Hornet/tarball/master
 
 Dependencied will be installed automatically.
-
-Testing
-#######
-
-To run the tests, execute `py.test` from within this directory.
