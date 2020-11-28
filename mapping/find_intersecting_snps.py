@@ -344,7 +344,7 @@ def assign_reads(insam, snp_dict, indel_dict, is_paired=True, phased=False, keep
         if not is_paired:
             read_seqs = get_read_seqs(read, snp_dict, indel_dict, read_results,
                                      phased)
-            write_read_seqs([(read, read_seqs)], keep, remap_bam, fastqs)
+            remap_num += write_read_seqs([(read, read_seqs)], keep, remap_bam, fastqs, dropped_bam, remap_num)
         elif read.is_proper_pair:
             slot_self = read.is_read2 # 0 if is_read1, 1 if is_read2
             slot_other = read.is_read1
