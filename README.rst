@@ -33,7 +33,7 @@ Example:
 
 .. code:: shell
  
-STAR \
+	STAR \
             --genomeDir genome_dir/STAR \
             --outFileNamePrefix analysis_dir/STAR1/ \
             --outSAMattributes MD NH \
@@ -116,7 +116,7 @@ Example:
 
 .. code:: shell
 
-STAR \
+	STAR \
             --genomeDir genome_dir/STAR \
             --outFileNamePrefix analysis_dir/remap/ \
             --outSAMattributes MD NH \
